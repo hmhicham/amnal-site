@@ -1,0 +1,1 @@
+web: cd "site amnal/systeme-pannes-backend" && npm start

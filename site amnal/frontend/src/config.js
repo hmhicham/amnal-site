@@ -6,7 +6,7 @@ const config = {
   // En développement: http://localhost:3000/api
   // En production: Remplacez par l'IP ou le domaine de votre serveur
   API_URL: import.meta.env.PROD 
-    ? '/.netlify/functions/api'  // Use Netlify Functions as proxy
+    ? 'https://YOUR-RAILWAY-APP.railway.app/api'  // Replace with your Railway URL
     : 'http://localhost:3000/api',
   
   // Nom de l'application

@@ -1,0 +1,467 @@
+// server.js - Backend Node.js/Express with SQL Server
+const express = require('express');
+const sql = require('mssql');
+const cors = require('cors');
+const nodemailer = require('nodemailer');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'votre_secret_key_ici';
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Configuration de la base de données SQL Server
+const dbConfig = {
+  server: process.env.DB_HOST || 'localhost',
+  port: parseInt(process.env.DB_PORT) || 1433,
+  database: process.env.DB_NAME || 'systeme_pannes_it',
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  options: {
+    encrypt: false,
+    trustServerCertificate: true,
+    enableArithAbort: true
+  },
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000
+  }
+};
+
+// Variable globale pour la connexion
+let pool;
+
+// Fonction de connexion à SQL Server
+async function connectToDatabase() {
+  try {
+    pool = await sql.connect(dbConfig);
+    console.log('✅ Connecté à SQL Server');
+    return pool;
+  } catch (err) {
+    console.error('❌ Erreur SQL Server:', err);
+    throw err;
+  }
+}
+
+// Configuration Nodemailer pour les emails
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: process.env.SMTP_PORT || 587,
+  secure: false,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+// Middleware d'authentification
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Token manquant' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Token invalide' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// ============= ROUTES D'AUTHENTIFICATION =============
+
+// Inscription utilisateur
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { nom, email, password, role, departement } = req.body;
+    
+    // Vérifier si l'email existe déjà
+    const existing = await pool.query(
+      'SELECT id FROM utilisateurs WHERE email = $1',
+      [email]
+    );
+    
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'Email déjà utilisé' });
+    }
+
+    // Hasher le mot de passe
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    // Insérer l'utilisateur
+    const result = await pool.query(
+      'INSERT INTO utilisateurs (nom, email, password, role, departement) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [nom, email, hashedPassword, role || 'user', departement]
+    );
+
+    res.status(201).json({
+      message: 'Utilisateur créé avec succès',
+      userId: result.rows[0].id
+    });
+  } catch (error) {
+    console.error('Erreur inscription:', error);
+    res.status(500).json({ error: 'Erreur lors de l\'inscription' });
+  }
+});
+
+// Connexion
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    // Récupérer l'utilisateur
+    const users = await pool.query(
+      'SELECT * FROM utilisateurs WHERE email = $1',
+      [email]
+    );
+
+    if (users.rows.length === 0) {
+      return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
+    }
+
+    const user = users.rows[0];
+
+    // Vérifier le mot de passe
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
+    }
+
+    // Créer le token JWT
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        nom: user.nom,
+        email: user.email,
+        role: user.role,
+        departement: user.departement
+      }
+    });
+  } catch (error) {
+    console.error('Erreur connexion:', error);
+    res.status(500).json({ error: 'Erreur lors de la connexion' });
+  }
+});
+
+// ============= ROUTES TICKETS =============
+
+// Créer un nouveau ticket
+app.post('/api/tickets', authenticateToken, async (req, res) => {
+  try {
+    const {
+      typePanne,
+      priorite,
+      description,
+      materiel
+    } = req.body;
+
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      `INSERT INTO tickets 
+       (utilisateur_id, type_panne, priorite, description, materiel, statut, date_creation) 
+       VALUES ($1, $2, $3, $4, $5, 'en_attente', NOW()) RETURNING id`,
+      [userId, typePanne, priorite, description, materiel]
+    );
+
+    const ticketId = result.rows[0].id;
+
+    // Ajouter une entrée dans l'historique
+    await pool.query(
+      `INSERT INTO historique_tickets (ticket_id, action, effectue_par, date_action) 
+       VALUES ($1, 'Ticket créé', $2, NOW())`,
+      [ticketId, userId]
+    );
+
+    // Envoyer un email de notification (optionnel)
+    await envoyerEmailNotification(ticketId, 'nouveau');
+
+    res.status(201).json({
+      message: 'Ticket créé avec succès',
+      ticketId
+    });
+  } catch (error) {
+    console.error('Erreur création ticket:', error);
+    res.status(500).json({ error: 'Erreur lors de la création du ticket' });
+  }
+});
+
+// Récupérer tous les tickets (avec filtres optionnels)
+app.get('/api/tickets', authenticateToken, async (req, res) => {
+  try {
+    const { statut, priorite, userId } = req.query;
+    
+    let query = `
+      SELECT 
+        t.*,
+        u.nom as utilisateur_nom,
+        u.email as utilisateur_email,
+        u.departement,
+        tech.nom as technicien_nom
+      FROM tickets t
+      JOIN utilisateurs u ON t.utilisateur_id = u.id
+      LEFT JOIN utilisateurs tech ON t.technicien_id = tech.id
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    let paramCount = 1;
+
+    if (statut) {
+      query += ` AND t.statut = $${paramCount}`;
+      params.push(statut);
+      paramCount++;
+    }
+
+    if (priorite) {
+      query += ` AND t.priorite = $${paramCount}`;
+      params.push(priorite);
+      paramCount++;
+    }
+
+    // Si l'utilisateur n'est pas technicien, voir seulement ses tickets
+    if (req.user.role !== 'technicien' && req.user.role !== 'admin') {
+      query += ` AND t.utilisateur_id = $${paramCount}`;
+      params.push(req.user.id);
+      paramCount++;
+    }
+
+    if (userId) {
+      query += ` AND t.utilisateur_id = $${paramCount}`;
+      params.push(userId);
+      paramCount++;
+    }
+
+    query += ' ORDER BY t.date_creation DESC';
+
+    const tickets = await pool.query(query, params);
+
+    res.json(tickets.rows);
+  } catch (error) {
+    console.error('Erreur récupération tickets:', error);
+    res.status(500).json({ error: 'Erreur lors de la récupération des tickets' });
+  }
+});
+
+// Récupérer un ticket spécifique
+app.get('/api/tickets/:id', authenticateToken, async (req, res) => {
+  try {
+    const ticketId = req.params.id;
+
+    const tickets = await pool.query(
+      `SELECT 
+        t.*,
+        u.nom as utilisateur_nom,
+        u.email as utilisateur_email,
+        u.departement,
+        tech.nom as technicien_nom
+      FROM tickets t
+      JOIN utilisateurs u ON t.utilisateur_id = u.id
+      LEFT JOIN utilisateurs tech ON t.technicien_id = tech.id
+      WHERE t.id = $1`,
+      [ticketId]
+    );
+
+    if (tickets.rows.length === 0) {
+      return res.status(404).json({ error: 'Ticket non trouvé' });
+    }
+
+    // Récupérer l'historique
+    const historique = await pool.query(
+      `SELECT h.*, u.nom as effectue_par_nom
+       FROM historique_tickets h
+       JOIN utilisateurs u ON h.effectue_par = u.id
+       WHERE h.ticket_id = $1
+       ORDER BY h.date_action DESC`,
+      [ticketId]
+    );
+
+    res.json({
+      ...tickets.rows[0],
+      historique: historique.rows
+    });
+  } catch (error) {
+    console.error('Erreur récupération ticket:', error);
+    res.status(500).json({ error: 'Erreur lors de la récupération du ticket' });
+  }
+});
+
+// Mettre à jour le statut d'un ticket
+app.patch('/api/tickets/:id/statut', authenticateToken, async (req, res) => {
+  try {
+    const ticketId = req.params.id;
+    const { statut, notes } = req.body;
+
+    // Vérifier que l'utilisateur est technicien ou admin
+    if (req.user.role !== 'technicien' && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    // Mettre à jour le ticket
+    await pool.query(
+      `UPDATE tickets 
+       SET statut = $1, 
+           technicien_id = $2,
+           notes_technicien = COALESCE($3, notes_technicien),
+           date_modification = NOW()
+       WHERE id = $4`,
+      [statut, req.user.id, notes, ticketId]
+    );
+
+    // Ajouter à l'historique
+    await pool.query(
+      `INSERT INTO historique_tickets (ticket_id, action, effectue_par, date_action) 
+       VALUES ($1, $2, $3, NOW())`,
+      [ticketId, `Statut changé vers: ${statut}`, req.user.id]
+    );
+
+    // Envoyer notification email
+    await envoyerEmailNotification(ticketId, 'mise_a_jour', statut);
+
+    res.json({ message: 'Statut mis à jour avec succès' });
+  } catch (error) {
+    console.error('Erreur mise à jour statut:', error);
+    res.status(500).json({ error: 'Erreur lors de la mise à jour' });
+  }
+});
+
+// Ajouter une note à un ticket
+app.post('/api/tickets/:id/notes', authenticateToken, async (req, res) => {
+  try {
+    const ticketId = req.params.id;
+    const { note } = req.body;
+
+    if (req.user.role !== 'technicien' && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    await pool.query(
+      `UPDATE tickets 
+       SET notes_technicien = COALESCE(notes_technicien, '') || E'\n[' || NOW() || '] ' || $1
+       WHERE id = $2`,
+      [note, ticketId]
+    );
+
+    await pool.query(
+      `INSERT INTO historique_tickets (ticket_id, action, effectue_par, date_action) 
+       VALUES ($1, $2, $3, NOW())`,
+      [ticketId, `Note ajoutée: ${note}`, req.user.id]
+    );
+
+    res.json({ message: 'Note ajoutée avec succès' });
+  } catch (error) {
+    console.error('Erreur ajout note:', error);
+    res.status(500).json({ error: 'Erreur lors de l\'ajout de la note' });
+  }
+});
+
+// ============= STATISTIQUES =============
+
+app.get('/api/stats', authenticateToken, async (req, res) => {
+  try {
+    const stats = await pool.query(`
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN statut = 'en_attente' THEN 1 ELSE 0 END) as en_attente,
+        SUM(CASE WHEN statut = 'en_cours' THEN 1 ELSE 0 END) as en_cours,
+        SUM(CASE WHEN statut = 'resolu' THEN 1 ELSE 0 END) as resolu,
+        SUM(CASE WHEN statut = 'ferme' THEN 1 ELSE 0 END) as ferme,
+        SUM(CASE WHEN priorite = 'urgente' THEN 1 ELSE 0 END) as urgente,
+        SUM(CASE WHEN priorite = 'haute' THEN 1 ELSE 0 END) as haute
+      FROM tickets
+    `);
+
+    res.json(stats.rows[0]);
+  } catch (error) {
+    console.error('Erreur statistiques:', error);
+    res.status(500).json({ error: 'Erreur lors de la récupération des statistiques' });
+  }
+});
+
+// ============= FONCTION ENVOI EMAIL =============
+
+async function envoyerEmailNotification(ticketId, type, statut = null) {
+  try {
+    const tickets = await pool.query(
+      `SELECT t.*, u.nom, u.email 
+       FROM tickets t 
+       JOIN utilisateurs u ON t.utilisateur_id = u.id 
+       WHERE t.id = $1`,
+      [ticketId]
+    );
+
+    if (tickets.rows.length === 0) return;
+
+    const ticket = tickets.rows[0];
+    let subject = '';
+    let message = '';
+
+    if (type === 'nouveau') {
+      subject = `Nouveau ticket #${ticketId} créé`;
+      message = `
+        Un nouveau ticket a été créé.
+        
+        Utilisateur: ${ticket.nom}
+        Type de panne: ${ticket.type_panne}
+        Priorité: ${ticket.priorite}
+        Description: ${ticket.description}
+      `;
+    } else if (type === 'mise_a_jour') {
+      subject = `Ticket #${ticketId} - Mise à jour`;
+      message = `
+        Votre ticket a été mis à jour.
+        
+        Nouveau statut: ${statut}
+        Numéro de ticket: ${ticketId}
+      `;
+    }
+
+    await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: ticket.email,
+      subject: subject,
+      text: message
+    });
+
+    console.log(`Email envoyé pour le ticket #${ticketId}`);
+  } catch (error) {
+    console.error('Erreur envoi email:', error);
+  }
+}
+
+// ============= DÉMARRAGE SERVEUR =============
+
+app.listen(PORT, () => {
+  console.log(`🚀 Serveur démarré sur le port ${PORT}`);
+  console.log(`📍 API disponible sur http://localhost:${PORT}`);
+  console.log(`🐘 Base de données: PostgreSQL`);
+});
+
+// Gestion des erreurs globales
+process.on('unhandledRejection', (error) => {
+  console.error('Erreur non gérée:', error);
+});
+
+// Fermeture propre
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM reçu, fermeture du serveur...');
+  await pool.end();
+  process.exit(0);
+});
